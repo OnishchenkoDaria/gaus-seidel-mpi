@@ -56,6 +56,8 @@ void PrintMatrix(double* pMatrix, int RowCount, int ColCount) {
 
 // Function for the execution of the Gauss-Seidel method iteration
 double IterationCalculation(double* pProcRows, int Size, int RowNum) {
+    if (RowNum <= 2) return 0; // No computation needed
+
     double dm, dmax, temp;
     dmax = 0;
 
@@ -93,47 +95,32 @@ void ProcessInitialization(double*& pMatrix, double*& pProcRows, int& Size,
                            int& RowNum, double& Eps) {
     int RestRows;
 
-    // Setting the grid size
     if (ProcRank == 0) {
         printf("Grid size: %d\n", Size);
-        // do {
-        //     printf("\nEnter the grid size: ");
-        //     scanf("%d", &Size);
-        //     if (Size <= 2) {
-        //         printf("\n Size of grid must be greater than 2! \n");
-        //     }
-        //     if (Size < ProcNum) {
-        //         printf("Size of grid must be greater than"
-        //                "the number of processes! \n");
-        //     }
-        // } while ((Size <= 2) || (Size < ProcNum));
-
-        // Setting the required accuracy
-        // do {
-        //     printf("\nEnter the required accuracy: ");
-        //     scanf("%lf", &Eps);
-        //     printf("\nChosen accuracy = %lf", Eps);
-        //
-        //     if (Eps <= 0)
-        //         printf("\nAccuracy must be greater than 0!\n");
-        // } while (Eps <= 0);
         Eps = 0.1;
     }
 
     MPI_Bcast(&Size, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&Eps, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
-    // Define the number of matrix rows stored on each process
-    RestRows = Size;
-    for (int i = 0; i < ProcRank; i++)
-        RestRows = RestRows - RestRows / (ProcNum - i);
+    // Number of computational rows (excluding boundaries)
+    int CompRows = Size - 2;
 
-    RowNum = (RestRows - 2) / (ProcNum - ProcRank) + 2;
+    // Determine rows per process
+    int RowsPerProc = std::max(CompRows / ProcNum, 1);
+    int ExtraRows = CompRows % ProcNum;
 
-    // Memory allocation
+    if (ProcRank < ExtraRows) {
+        RowNum = RowsPerProc + 1 + 2;  // +2 for top and bottom boundary rows
+    } else if (ProcRank < CompRows) {
+        RowNum = RowsPerProc + 2;
+    } else {
+        RowNum = 2;  // Processes with no computational rows only have boundary rows
+    }
+
+    // Allocate memory
     pProcRows = new double[RowNum * Size];
 
-    // Define the values of initial objects’ elements
     if (ProcRank == 0) {
         pMatrix = new double[Size * Size];
         DummyDataInitialization(pMatrix, Size);
@@ -152,15 +139,15 @@ void ExchangeData(double* pProcRows, int Size, int RowNum) {
     int NextProcNum = (ProcRank == ProcNum - 1) ? MPI_PROC_NULL : ProcRank + 1;
     int PrevProcNum = (ProcRank == 0) ? MPI_PROC_NULL : ProcRank - 1;
 
-    // Send to NextProcNum and receive from PrevProcNum
-    MPI_Sendrecv(pProcRows + Size * (RowNum - 2), Size, MPI_DOUBLE,
-                 NextProcNum, 4, pProcRows, Size, MPI_DOUBLE, PrevProcNum, 4,
-                 MPI_COMM_WORLD, &status);
+    if (RowNum > 1) { // Ensure there is data to exchange
+        MPI_Sendrecv(pProcRows + Size * (RowNum - 2), Size, MPI_DOUBLE,
+                     NextProcNum, 0, pProcRows, Size, MPI_DOUBLE, PrevProcNum, 0,
+                     MPI_COMM_WORLD, &status);
 
-    // Send to PrevProcNum and receive from NextProcNum
-    MPI_Sendrecv(pProcRows + Size, Size, MPI_DOUBLE, PrevProcNum, 5,
-                 pProcRows + (RowNum - 1) * Size, Size, MPI_DOUBLE, NextProcNum, 5,
-                 MPI_COMM_WORLD, &status);
+        MPI_Sendrecv(pProcRows + Size, Size, MPI_DOUBLE, PrevProcNum, 1,
+                     pProcRows + (RowNum - 1) * Size, Size, MPI_DOUBLE, NextProcNum, 1,
+                     MPI_COMM_WORLD, &status);
+    }
 }
 
 // Function for the parallel Gauss-Seidel method
@@ -184,8 +171,31 @@ void ParallelResultCalculation(double* pProcRows, int Size, int RowNum, double E
 
 // Function for gathering the calculation results
 void ResultCollection(double* pMatrix, double* pProcRows, int Size, int RowNum) {
-    MPI_Gather(pProcRows + Size, (RowNum - 2) * Size, MPI_DOUBLE, pMatrix + Size,
-               (RowNum - 2) * Size, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    int* pReceiveNum = new int[ProcNum];
+    int* pReceiveInd = new int[ProcNum];
+    int RestRows = Size - 2;  // Computational rows only
+    int Offset = 0;
+
+    // Calculate rows contributed by each process
+    for (int i = 0; i < ProcNum; i++) {
+        int RowsPerProc = RestRows / ProcNum;
+        if (i < RestRows % ProcNum) {
+            RowsPerProc++;
+        }
+        pReceiveNum[i] = std::max(RowsPerProc * Size, 0);
+        pReceiveInd[i] = Offset + Size;  // Offset in the flat array
+        Offset += pReceiveNum[i];
+        if (ProcRank == 0) {
+            printf("Process %d contributes %d rows (index offset = %d)\n", i,
+                   RowsPerProc, pReceiveInd[i]);
+        }
+    }
+
+    MPI_Gatherv(pProcRows + Size, std::max((RowNum - 2) * Size, 0), MPI_DOUBLE,
+                pMatrix + Size, pReceiveNum, pReceiveInd, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    delete[] pReceiveNum;
+    delete[] pReceiveInd;
 }
 
 // Main function
